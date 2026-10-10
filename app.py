@@ -1,7 +1,6 @@
 
 import os
-import re
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 
 import requests
@@ -9,7 +8,7 @@ from flask import Flask, render_template, request, jsonify
 
 app = Flask(__name__)
 
-TIMEOUT = (3, 8)
+TIMEOUT = (3, 7)
 MAX_RESULTS = 6
 
 OFFICIAL_DOMAINS = (
@@ -18,6 +17,8 @@ OFFICIAL_DOMAINS = (
     "scholarships.gov.in",
     "education.gov.in",
     "pib.gov.in",
+    "ugc.gov.in",
+    "aicte-india.org",
 )
 
 SCHOLARSHIP_TERMS = (
@@ -39,17 +40,26 @@ def is_official_url(url):
         return False
 
 
-def build_search_query(claim):
+def build_queries(claim):
+    queries = {
+        "web": claim,
+        "news": claim,
+    }
+
     text = claim.lower()
 
     if any(term in text for term in SCHOLARSHIP_TERMS):
-        return (
-            f'"National Scholarship Portal" {claim} '
+        queries["official"] = (
+            f'{claim} '
             '(site:scholarships.gov.in OR site:education.gov.in '
             'OR site:gov.in OR site:nic.in)'
         )
+    else:
+        queries["official"] = (
+            f'{claim} (site:gov.in OR site:nic.in)'
+        )
 
-    return claim
+    return queries
 
 
 def search(query, engine):
@@ -59,43 +69,41 @@ def search(query, engine):
             "SERPAPI_KEY is missing from Render Environment."
         )
 
-    params = {
-        "engine": engine,
-        "q": query,
-        "api_key": key,
-        "gl": "in",
-        "hl": "en",
-        "num": MAX_RESULTS,
-    }
-
     response = requests.get(
         "https://serpapi.com/search.json",
-        params=params,
+        params={
+            "engine": engine,
+            "q": query,
+            "api_key": key,
+            "gl": "in",
+            "hl": "en",
+            "num": MAX_RESULTS,
+        },
         timeout=TIMEOUT,
     )
+
     response.raise_for_status()
     data = response.json()
 
     if data.get("error"):
         raise RuntimeError(data["error"])
 
-    if engine == "google":
-        items = data.get("organic_results", [])
-    else:
+    if engine == "google_news":
         items = data.get("news_results", [])
+    else:
+        items = data.get("organic_results", [])
 
     results = []
 
     for item in items:
-        source = item.get("source", "")
-
-        if isinstance(source, dict):
-            source = source.get("name", "")
-
         link = item.get("link", "")
 
         if not link.startswith(("https://", "http://")):
             continue
+
+        source = item.get("source", "")
+        if isinstance(source, dict):
+            source = source.get("name", "")
 
         results.append({
             "title": item.get("title", "Untitled result"),
@@ -106,12 +114,7 @@ def search(query, engine):
             "official_source": is_official_url(link),
         })
 
-    # Prefer official sources, without claiming that they prove the claim.
-    results.sort(
-        key=lambda item: not item["official_source"]
-    )
-
-    return results[:MAX_RESULTS]
+    return results
 
 
 @app.get("/")
@@ -142,42 +145,70 @@ def verify():
             "error": "Keep the claim under 500 characters."
         }), 400
 
-    query = build_search_query(claim)
-    web_results = []
-    news_results = []
-    search_errors = {}
+    queries = build_queries(claim)
+    jobs = {
+        "web": (queries["web"], "google"),
+        "news": (queries["news"], "google_news"),
+        "official": (queries["official"], "google"),
+    }
 
-    # Run both searches concurrently so their waits overlap.
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        tasks = {
-            "web": executor.submit(search, query, "google"),
-            "news": executor.submit(search, claim, "google_news"),
+    results_by_search = {}
+    errors = {}
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {
+            executor.submit(search, query, engine): name
+            for name, (query, engine) in jobs.items()
         }
 
-        for name, task in tasks.items():
+        for future in as_completed(futures):
+            name = futures[future]
             try:
-                results = task.result(timeout=10)
-
-                if name == "web":
-                    web_results = results
-                else:
-                    news_results = results
-
+                results_by_search[name] = future.result()
             except Exception as exc:
-                search_errors[name] = str(exc)
+                errors[name] = str(exc)
                 app.logger.warning(
                     "%s search failed: %s", name, exc
                 )
 
-    total = len(web_results) + len(news_results)
+    web_results = []
+    news_results = results_by_search.get("news", [])
+
+    for name in ("official", "web"):
+        web_results.extend(results_by_search.get(name, []))
+
+    # Deduplicate results by URL.
+    seen = set()
+    unique_web = []
+
+    for item in web_results:
+        url = item["link"].rstrip("/")
+        if url not in seen:
+            seen.add(url)
+            unique_web.append(item)
+
+    unique_web.sort(
+        key=lambda item: not item["official_source"]
+    )
+
+    seen_news = set()
+    unique_news = []
+
+    for item in news_results:
+        url = item["link"].rstrip("/")
+        if url not in seen_news:
+            seen_news.add(url)
+            unique_news.append(item)
+
+    total = len(unique_web) + len(unique_news)
 
     if total == 0:
         return jsonify({
             "claim": claim,
             "status": "Search unavailable",
             "error": (
-                "No sources were retrieved. Check the SerpApi key, "
-                "remaining searches, provider status, and Render logs."
+                "No results were retrieved. Check the API key, "
+                "search quota, provider status, and server logs."
             ),
             "explanation": (
                 "A failed search does not mean the claim is false."
@@ -185,29 +216,22 @@ def verify():
             "web_results": [],
             "news_results": [],
             "total_results": 0,
-            "search_errors": search_errors,
+            "search_errors": errors,
         }), 502
-
-    if search_errors:
-        explanation = (
-            "Some searches failed. Review the available evidence and "
-            "the search errors before drawing a conclusion."
-        )
-    else:
-        explanation = (
-            "Search results are leads, not proof. Open the original "
-            "sources, check their dates and credibility, and determine "
-            "whether they directly support or contradict the claim."
-        )
 
     return jsonify({
         "claim": claim,
         "status": "Unverified",
-        "explanation": explanation,
-        "web_results": web_results,
-        "news_results": news_results,
-        "total_results": total,
-        "search_errors": search_errors,
+        "explanation": (
+            "Results are evidence leads, not proof. Official-domain "
+            "matches are prioritised, but each source must be checked "
+            "for relevance, date, credibility, and direct support."
+        ),
+        "web_results": unique_web[:MAX_RESULTS],
+        "news_results": unique_news[:MAX_RESULTS],
+        "total_results": min(len(unique_web), MAX_RESULTS)
+        + min(len(unique_news), MAX_RESULTS),
+        "search_errors": errors,
     })
 
 
